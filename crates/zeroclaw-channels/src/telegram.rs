@@ -268,7 +268,7 @@ enum QueuedTelegramUpdatePayload {
     MediaGroup(MediaGroupKey),
 }
 
-/// Metadata for an incoming document or photo attachment.
+/// Metadata for an incoming document, photo, or static sticker attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct IncomingAttachment {
     file_id: String,
@@ -280,11 +280,12 @@ struct IncomingAttachment {
     kind: IncomingAttachmentKind,
 }
 
-/// The kind of incoming attachment (document vs photo).
+/// The kind of incoming attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncomingAttachmentKind {
     Document,
     Photo,
+    Sticker,
 }
 const TELEGRAM_BIND_COMMAND: &str = "/bind";
 /// Telegram Bot API allows at most 100 commands via setMyCommands.
@@ -793,7 +794,7 @@ fn telegram_audio_send_spec(
 /// The disposition Telegram commits to for an inbound attachment, resolved once
 /// against the provider's loadability contract.
 ///
-/// `parse_attachment_metadata` only yields documents and photos, so an
+/// `parse_attachment_metadata` only yields documents, photos, and static stickers, so an
 /// attachment is either a loadable image the provider will accept or a
 /// document. The rendered text and the typed envelope both read this one
 /// verdict, so a document the loader would reject cannot be re-decided as an
@@ -4428,11 +4429,12 @@ impl TelegramChannel {
 
         // If the user is replying directly to the bot's message, bypass the
         // mention check — replies are an unambiguous signal of intent.
-        if let Some(caption) = caption
-            && let Some(bot_id) = *self.bot_id.lock()
+        if let Some(bot_id) = *self.bot_id.lock()
             && Self::is_reply_to_bot(message, bot_id)
         {
-            return Some(Self::normalize_incoming_content(caption, bot_username));
+            return Some(
+                caption.and_then(|text| Self::normalize_incoming_content(text, bot_username)),
+            );
         }
 
         let caption = caption?;
@@ -4541,7 +4543,7 @@ impl TelegramChannel {
         self.workspace_dir.is_some() && Self::parse_attachment_metadata(message).is_some()
     }
 
-    /// True when `message` is a voice/audio or document/photo update that
+    /// True when `message` is a voice/audio, document/photo, or static sticker update that
     /// one of the update parsers would permanently bail on for size or
     /// duration alone, independent of authorization — mirroring
     /// `try_parse_voice_message`'s over-`max_duration_secs` bail (using
@@ -4577,7 +4579,7 @@ impl TelegramChannel {
 
         // Only updates an authorized sender would have gotten processed
         // deserve the unauthorized notice. Everything else — service
-        // messages (joins/leaves/pins), stickers, locations, contacts,
+        // messages (joins/leaves/pins), unsupported stickers, locations, contacts,
         // or media this deployment is not configured to process — stays
         // silent exactly as before; a notice would either spam group
         // chats on every join, or promise processing that can never
@@ -4887,8 +4889,8 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         Some((file_id, duration))
     }
 
-    /// Extract attachment metadata from an incoming Telegram message (document or photo).
-    /// Returns `None` for text-only, voice, and other unsupported message types.
+    /// Extract attachment metadata from an incoming Telegram message (document, photo, or
+    /// static sticker). Animated and video stickers need a separate media decoder.
     fn parse_attachment_metadata(message: &serde_json::Value) -> Option<IncomingAttachment> {
         // Try document first
         if let Some(doc) = message.get("document") {
@@ -4932,6 +4934,33 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 caption,
                 mime_type: None,
                 kind: IncomingAttachmentKind::Photo,
+            });
+        }
+
+        // Static Telegram stickers are WebP images and can use the same image pipeline as
+        // photos. TGS animations and WEBM video stickers are not image inputs.
+        if let Some(sticker) = message.get("sticker") {
+            if sticker
+                .get("is_animated")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+                || sticker.get("is_video").and_then(serde_json::Value::as_bool) == Some(true)
+            {
+                return None;
+            }
+            let file_id = sticker.get("file_id")?.as_str()?.to_string();
+            let file_size = sticker.get("file_size").and_then(serde_json::Value::as_u64);
+            let caption = message
+                .get("caption")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from);
+            return Some(IncomingAttachment {
+                file_id,
+                file_name: None,
+                file_size,
+                caption,
+                mime_type: Some("image/webp".into()),
+                kind: IncomingAttachmentKind::Sticker,
             });
         }
 
@@ -5045,9 +5074,13 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 (local_filename, display_filename)
             }
             None => {
-                // For photos, derive extension from Telegram file path
+                // For photos and stickers, derive extension from Telegram file path.
                 let ext = tg_file_path.rsplit('.').next().unwrap_or("jpg");
-                let filename = format!("photo_{chat_id}_{message_id}.{ext}");
+                let prefix = match attachment.kind {
+                    IncomingAttachmentKind::Sticker => "sticker",
+                    _ => "photo",
+                };
+                let filename = format!("{prefix}_{chat_id}_{message_id}.{ext}");
                 (filename.clone(), filename)
             }
         };
@@ -9756,7 +9789,7 @@ mod tests {
             channels.insert("telegram.test".into(), Arc::new(channel));
             let tool = ReactionTool::new(
                 Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
-                Arc::new(RwLock::new(channels)),
+                Arc::new(parking_lot::RwLock::new(channels)),
             );
             let result = tool
                 .execute(serde_json::json!({
@@ -17198,6 +17231,36 @@ mod tests {
     }
 
     #[test]
+    fn check_media_mention_gate_allows_captionless_reply_to_bot() {
+        let ch = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            true,
+        );
+        *ch.bot_username.lock() = Some("mybot".to_string());
+        *ch.bot_id.lock() = Some(42);
+
+        let sticker_reply = serde_json::json!({
+            "message_id": 59,
+            "from": { "id": 555, "username": "alice" },
+            "chat": { "id": -100_200_300, "type": "group" },
+            "sticker": { "file_id": "static-sticker" },
+            "reply_to_message": {
+                "message_id": 54,
+                "from": { "id": 42, "username": "mybot", "is_bot": true },
+                "text": "send me a sticker"
+            }
+        });
+
+        assert_eq!(
+            ch.check_media_mention_gate(&sticker_reply, None),
+            Some(None),
+            "a captionless reply to the bot should pass the mention_only gate"
+        );
+    }
+
+    #[test]
     fn telegram_is_group_message_detects_groups() {
         let group_msg = serde_json::json!({
             "chat": { "type": "group" }
@@ -20209,6 +20272,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_attachment_metadata_detects_static_sticker() {
+        let message = serde_json::json!({
+            "sticker": {
+                "file_id": "static_sticker_id",
+                "file_size": 4096,
+                "width": 512,
+                "height": 512,
+                "is_animated": false,
+                "is_video": false,
+                "emoji": "😮"
+            }
+        });
+        let att = TelegramChannel::parse_attachment_metadata(&message).unwrap();
+        assert_eq!(att.kind, IncomingAttachmentKind::Sticker);
+        assert_eq!(att.file_id, "static_sticker_id");
+        assert_eq!(att.file_size, Some(4096));
+        assert_eq!(att.mime_type.as_deref(), Some("image/webp"));
+        assert!(att.file_name.is_none());
+    }
+
+    #[test]
+    fn parse_attachment_metadata_skips_animated_and_video_stickers() {
+        for sticker in [
+            serde_json::json!({"file_id": "animated", "is_animated": true}),
+            serde_json::json!({"file_id": "video", "is_video": true}),
+        ] {
+            let message = serde_json::json!({"sticker": sticker});
+            assert!(TelegramChannel::parse_attachment_metadata(&message).is_none());
+        }
+    }
+
+    #[test]
     fn parse_attachment_metadata_extracts_caption() {
         // Document with caption
         let doc_msg = serde_json::json!({
@@ -22900,6 +22995,82 @@ mod tests {
             msg.content.contains("[IMAGE:"),
             "content marker must still be emitted for the multimodal pipeline: {}",
             msg.content
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_static_sticker_is_saved_and_populates_image_envelope() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::media::MediaKind;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let mock_server = MockServer::start().await;
+        let image = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([255, 0, 0, 255]),
+        ));
+        let mut webp_cursor = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut webp_cursor, image::ImageFormat::WebP)
+            .unwrap();
+        let webp_bytes = webp_cursor.into_inner();
+
+        Mock::given(method("GET"))
+            .and(path_regex(r"/bot[^/]+/getFile$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "file_path": "stickers/static.webp" }
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/file/bot[^/]+/stickers/static\.webp$"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(webp_bytes.clone()))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let ch = TelegramChannel::new(
+            "fake-token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_mock_api_base(mock_server.uri())
+        .with_workspace_dir(workspace.path().to_path_buf());
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 42,
+                "chat": { "id": 123 },
+                "from": { "username": "alice", "id": 99 },
+                "sticker": {
+                    "file_id": "static-sticker",
+                    "file_size": webp_bytes.len(),
+                    "is_animated": false,
+                    "is_video": false
+                }
+            }
+        });
+
+        let msg = ch
+            .try_parse_attachment_message(&update)
+            .await
+            .expect_parsed("static sticker should parse into an image attachment");
+
+        assert_eq!(msg.attachments.len(), 1);
+        assert_eq!(msg.attachments[0].kind(), MediaKind::Image);
+        assert_eq!(msg.attachments[0].mime_type.as_deref(), Some("image/webp"));
+        assert_eq!(msg.attachments[0].data, webp_bytes);
+        let saved_path = workspace.path().join("telegram_files/sticker_123_42.webp");
+        assert!(saved_path.is_file(), "sticker bytes should be persisted");
+        assert_eq!(std::fs::read(&saved_path).unwrap(), msg.attachments[0].data);
+        assert_eq!(
+            msg.content,
+            format!("[IMAGE:{}]", saved_path.display()),
+            "sticker content should point to the unique saved image path"
         );
     }
 
