@@ -1136,6 +1136,82 @@ impl TelegramChannel {
         });
     }
 
+    /// Accept platform IDs and the scoped IDs emitted by this adapter. Scoped
+    /// IDs must belong to the requested chat, including for forum reply targets.
+    fn reaction_target(channel_id: &str, message_id: &str) -> anyhow::Result<(String, i64)> {
+        let invalid = || {
+            anyhow::anyhow!(telegram_cli_string(
+                "channel-telegram-reaction-invalid-target"
+            ))
+        };
+        let (chat_id, _) = Self::parse_reply_target(channel_id);
+        if chat_id.is_empty() {
+            return Err(invalid());
+        }
+        let platform_id = if let Some(scoped) = message_id.strip_prefix("telegram_") {
+            let (scope, id) = scoped.rsplit_once('_').ok_or_else(invalid)?;
+            if scope != chat_id {
+                return Err(invalid());
+            }
+            id
+        } else {
+            message_id
+        };
+        let id = platform_id.parse::<i64>().map_err(|_| invalid())?;
+        if id <= 0 {
+            return Err(invalid());
+        }
+        Ok((chat_id, id))
+    }
+
+    async fn set_message_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let (chat_id, id) = Self::reaction_target(channel_id, message_id)?;
+        let mut body = match emoji {
+            Some(emoji) if !emoji.trim().is_empty() => {
+                build_telegram_ack_reaction_request(&chat_id, id, emoji)
+            }
+            Some(_) => anyhow::bail!(telegram_cli_string("channel-telegram-reaction-empty-emoji")),
+            None => serde_json::json!({"chat_id": chat_id, "message_id": id, "reaction": []}),
+        };
+        body["is_big"] = serde_json::json!(false);
+        let response = self
+            .http_client()
+            .post(self.api_url("setMessageReaction"))
+            .timeout(Duration::from_secs(15))
+            .json(&body)
+            .send()
+            .await
+            // reqwest errors can contain the bot token in the request URL.
+            .map_err(|err| anyhow::anyhow!(err.without_url()))?;
+        let status = response.status();
+        let envelope: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|err| anyhow::anyhow!(err.without_url()))?;
+        if !status.is_success()
+            || envelope.get("ok").and_then(serde_json::Value::as_bool) != Some(true)
+            || envelope.get("result").and_then(serde_json::Value::as_bool) != Some(true)
+        {
+            let description = envelope
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("invalid setMessageReaction response");
+            let detail = zeroclaw_runtime::security::scrub(
+                &description.replace(&self.bot_token, "[REDACTED]"),
+            );
+            anyhow::bail!(i18n::get_required_cli_string_with_args(
+                "channel-telegram-reaction-failed",
+                &[("detail", detail.as_str())],
+            ));
+        }
+        Ok(())
+    }
+
     fn http_client(&self) -> reqwest::Client {
         zeroclaw_config::schema::build_channel_proxy_client(
             "channel.telegram",
@@ -4174,6 +4250,27 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    async fn add_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        emoji: &str,
+    ) -> anyhow::Result<()> {
+        self.set_message_reaction(channel_id, message_id, Some(emoji))
+            .await
+    }
+
+    async fn remove_reaction(
+        &self,
+        channel_id: &str,
+        message_id: &str,
+        _emoji: &str,
+    ) -> anyhow::Result<()> {
+        // Bots have one reaction slot per message. An empty array clears it.
+        self.set_message_reaction(channel_id, message_id, None)
+            .await
+    }
+
     fn self_handle(&self) -> Option<String> {
         self.bot_username.lock().clone()
     }
@@ -5378,6 +5475,237 @@ mod tests {
         assert_eq!(body["message_id"], 42);
         assert_eq!(body["reaction"][0]["type"], "emoji");
         assert_eq!(body["reaction"][0]["emoji"], "⚡️");
+    }
+
+    #[test]
+    fn telegram_reaction_target_accepts_native_and_scoped_ids() {
+        for message_id in ["42", "telegram_-100200300_42"] {
+            assert_eq!(
+                TelegramChannel::reaction_target("-100200300:7", message_id).unwrap(),
+                ("-100200300".to_string(), 42)
+            );
+        }
+    }
+
+    #[test]
+    fn telegram_reaction_target_rejects_invalid_or_cross_chat_ids() {
+        for id in [
+            "0",
+            "-1",
+            "abc",
+            "42_extra",
+            "telegram_-100999_42",
+            "telegram_42",
+        ] {
+            assert!(TelegramChannel::reaction_target("-100200300", id).is_err());
+        }
+        assert!(TelegramChannel::reaction_target("", "42").is_err());
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_add_and_remove_cross_http_boundary() {
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for reaction in [
+            serde_json::json!([{"type": "emoji", "emoji": "❤"}]),
+            serde_json::json!([]),
+        ] {
+            Mock::given(method("POST"))
+                .and(path("/botfake-token/setMessageReaction"))
+                .and(body_json(serde_json::json!({
+                    "chat_id": "-100200300", "message_id": 42,
+                    "reaction": reaction, "is_big": false
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({"ok": true, "result": true})),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri());
+        let channel: &dyn Channel = &channel;
+        channel
+            .add_reaction("-100200300:7", "telegram_-100200300_42", "❤")
+            .await
+            .unwrap();
+        channel
+            .remove_reaction("-100200300", "42", "❤")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_rejects_http_and_envelope_errors() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        for (status, envelope) in [
+            (
+                400,
+                serde_json::json!({"ok": false, "description": "REACTION_INVALID"}),
+            ),
+            (
+                200,
+                serde_json::json!({"ok": false, "description": "REACTION_INVALID"}),
+            ),
+            (200, serde_json::json!({"ok": true, "result": false})),
+            (200, serde_json::json!({"ok": true})),
+            (500, serde_json::json!({"ok": true, "result": true})),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/botfake-token/setMessageReaction"))
+                .respond_with(ResponseTemplate::new(status).set_body_json(envelope))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "test",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(server.uri());
+            assert!(
+                channel
+                    .add_reaction("-100200300", "42", "✨")
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_invalid_target_never_sends_request() {
+        let server = wiremock::MockServer::start().await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri());
+        assert!(
+            channel
+                .add_reaction("-100200300", "telegram_-100999_42", "❤")
+                .await
+                .is_err()
+        );
+        assert!(channel.add_reaction("-100200300", "42", " ").await.is_err());
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_errors_do_not_expose_token() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let channel = TelegramChannel::new(
+            "fake-token".into(),
+            "test",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_api_base(server.uri());
+        for response in [
+            ResponseTemplate::new(200).set_body_string("not json"),
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "ok": false, "description": "URL /botfake-token/setMessageReaction rejected"
+            })),
+        ] {
+            server.reset().await;
+            Mock::given(method("POST"))
+                .respond_with(response)
+                .mount(&server)
+                .await;
+            let error = channel
+                .add_reaction("-100200300", "42", "❤")
+                .await
+                .unwrap_err();
+            assert!(!format!("{error:#}").contains("fake-token"));
+        }
+        let address = server.uri();
+        drop(server);
+        let channel = channel.with_api_base(address);
+        let error = channel
+            .add_reaction("-100200300", "42", "❤")
+            .await
+            .unwrap_err();
+        assert!(!format!("{error:#}").contains("fake-token"));
+    }
+
+    #[tokio::test]
+    async fn telegram_reaction_tool_reports_vendor_result() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        use zeroclaw_api::tool::Tool;
+        use zeroclaw_tools::reaction::ReactionTool;
+
+        for success in [true, false] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/botfake-token/setMessageReaction"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({"ok": success, "result": success, "description": "REACTION_INVALID"})
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let channel = TelegramChannel::new(
+                "fake-token".into(),
+                "test",
+                Arc::new(|| vec!["*".into()]),
+                false,
+            )
+            .with_api_base(server.uri());
+            let mut channels = std::collections::HashMap::<String, Arc<dyn Channel>>::new();
+            channels.insert("telegram.test".into(), Arc::new(channel));
+            let tool = ReactionTool::new(
+                Arc::new(zeroclaw_config::policy::SecurityPolicy::default()),
+                Arc::new(RwLock::new(channels)),
+            );
+            let result = tool
+                .execute(serde_json::json!({
+                    "channel": "telegram.test", "channel_id": "-100200300",
+                    "message_id": "telegram_-100200300_42", "emoji": "❤"
+                }))
+                .await
+                .unwrap();
+            assert_eq!(result.success, success);
+            if success {
+                assert!(result.output.contains("Reaction added"));
+            } else {
+                assert!(result.output.is_empty());
+                assert!(result.error.unwrap().contains("REACTION_INVALID"));
+            }
+        }
+    }
+
+    #[test]
+    fn telegram_reaction_confirmation_overrides_always_grant() {
+        use zeroclaw_runtime::approval::{ApprovalManager, ApprovalResponse};
+        let profile = zeroclaw_config::schema::RiskProfileConfig {
+            level: zeroclaw_config::policy::AutonomyLevel::Supervised,
+            always_ask: vec!["reaction".into()],
+            ..Default::default()
+        };
+        let manager = ApprovalManager::for_non_interactive(&profile);
+        assert!(manager.needs_approval("reaction"));
+        for response in [ApprovalResponse::Always, ApprovalResponse::Yes] {
+            manager.record_decision("reaction", &serde_json::json!({}), &response, "telegram");
+            assert!(manager.needs_approval("reaction"));
+        }
     }
 
     #[test]

@@ -1228,3 +1228,6 @@ channel-approval-opt-allow-once = Allow once
 channel-approval-opt-allow-always = Always allow
 channel-approval-opt-reject = Reject
 channel-approval-opt-reject-with-edit = Reject with edit
+channel-telegram-reaction-invalid-target = Invalid Telegram reaction target: use a positive message ID, or a telegram_<chat_id>_<message_id> ID from the same chat.
+channel-telegram-reaction-empty-emoji = A Telegram reaction requires a non-empty emoji.
+channel-telegram-reaction-failed = Telegram setMessageReaction failed: { $detail }
