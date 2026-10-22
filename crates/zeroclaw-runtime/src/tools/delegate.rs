@@ -10,6 +10,7 @@ use crate::agent::loop_::{
     run_tool_call_loop,
 };
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
+use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
 use crate::approval::{ApprovalManager, ApprovalRequirement};
 use crate::live_config_authority::{AgentExecutionAdmission, AgentExecutionCapability};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
@@ -5111,39 +5112,54 @@ impl DelegateTool {
                 sub_deferred_section.push_str(&section);
             }
         }
-        let enriched_system_prompt = self.build_enriched_system_prompt_from_config(
-            target_config,
-            agent_name,
-            agent_config,
-            model,
-            &sub_tools,
-            Some(&hidden_builtin_names),
-            prompt_workspace,
-            native_tools,
-            sub_skills.as_deref(),
-            // Independent targets run under their own manager: state that
-            // exact policy in the prompt. Bounded delegates have none here.
-            approval_manager.as_ref(),
-        );
-        // Independent delegates surface the target's deferred MCP tools the way a fresh
-        // target turn does. See `compose_independent_system_prompt`: it applies the turn
-        // engine's text-tool prompt policy to the deferred section (so a non-native strict
-        // target suppresses it, exactly as a fresh turn would) and then appends it.
-        let enriched_system_prompt = Self::compose_independent_system_prompt(
-            enriched_system_prompt,
-            sub_deferred_section,
-            native_tools,
-            loop_runtime.strict_tool_parsing,
-        );
-        let enriched_system_prompt = match (
-            enriched_system_prompt,
-            thinking_params
-                .as_ref()
-                .and_then(|params| params.system_prompt_prefix.as_deref()),
-        ) {
-            (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
-            (None, Some(prefix)) => Some(prefix.to_string()),
-            (prompt, None) => prompt,
+        // Each delegated loop owns both complete prompt variants. Reusing the
+        // caller's task-local protocol cache can replace the target identity
+        // with the caller's capped native prompt, or inject caller text tools.
+        let build_prompt = |native_tools| {
+            let prompt = self.build_enriched_system_prompt_from_config(
+                target_config,
+                agent_name,
+                agent_config,
+                model,
+                &sub_tools,
+                Some(&hidden_builtin_names),
+                prompt_workspace,
+                native_tools,
+                sub_skills.as_deref(),
+                approval_manager.as_ref(),
+            );
+            let prompt = Self::compose_independent_system_prompt(
+                prompt,
+                sub_deferred_section.clone(),
+                native_tools,
+                loop_runtime.strict_tool_parsing,
+            );
+            match (
+                prompt,
+                thinking_params
+                    .as_ref()
+                    .and_then(|params| params.system_prompt_prefix.as_deref()),
+            ) {
+                (Some(prompt), Some(prefix)) => Some(format!("{prefix}\n\n{prompt}")),
+                (None, Some(prefix)) => Some(prefix.to_string()),
+                (prompt, None) => prompt,
+            }
+        };
+        let native_prompt = build_prompt(true);
+        let text_prompt = build_prompt(false);
+        let protocol_prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+            native_prompt.clone().unwrap_or_default(),
+            text_prompt.clone().unwrap_or_default(),
+            target_config
+                .or(self.root_config.as_deref())
+                .map_or(0, |config| {
+                    config.effective_max_system_prompt_chars(agent_name)
+                }),
+        ));
+        let enriched_system_prompt = if native_tools {
+            native_prompt
+        } else {
+            text_prompt
         };
 
         let mut history = Vec::new();
@@ -5288,6 +5304,10 @@ impl DelegateTool {
             .instrument(::zeroclaw_log::attribution_span!(
                 &crate::agent::AgentAttribution(agent_name)
             )),
+        );
+        let execution = scope_tool_protocol_prompts(
+            protocol_prompts,
+            futures_util::FutureExt::boxed(execution),
         );
         let execution =
             ExecutionTreeBudget::scope_optional(execution_tree_budget, Box::pin(execution));
@@ -11510,6 +11530,7 @@ mod tests {
 
     #[derive(Default)]
     struct ThinkingRecordingModelProvider {
+        native_tools: bool,
         requests: std::sync::Mutex<Vec<RecordedThinkingRequest>>,
     }
 
@@ -11523,6 +11544,10 @@ mod tests {
 
     #[async_trait]
     impl ModelProvider for ThinkingRecordingModelProvider {
+        fn supports_native_tools(&self) -> bool {
+            self.native_tools
+        }
+
         async fn chat_with_system(
             &self,
             _system_prompt: Option<&str>,
@@ -11638,6 +11663,228 @@ mod tests {
             .with_risk_profiles(config.risk_profiles.clone())
             .with_runtime_profiles(config.runtime_profiles.clone());
         (tool, target)
+    }
+
+    async fn capture_parent_protocol_request(prompt: String) -> String {
+        let provider = ThinkingRecordingModelProvider {
+            native_tools: true,
+            ..Default::default()
+        };
+        let tools =
+            crate::tools::scoped::ScopedToolRegistry::from_raw_for_test(vec![Box::new(EchoTool)]);
+        let mut history = vec![
+            ChatMessage::system(prompt),
+            ChatMessage::user("parent resumes"),
+        ];
+        let mut crumb = false;
+        let mut memory_preamble = None;
+        let observer = NoopObserver;
+        let multimodal = zeroclaw_config::schema::MultimodalConfig::default();
+        let pacing = zeroclaw_config::schema::PacingConfig::default();
+        let knobs = LoopKnobs::default();
+        run_tool_call_loop(ToolLoop {
+            exec: ResolvedAgentExecution::resolve(
+                ResolvedModelAccess {
+                    model_provider: &provider,
+                    provider_name: "custom",
+                    model: "test-model",
+                    dispatch_model: "test-model",
+                    temperature: None,
+                },
+                ResolvedIo {
+                    tools_registry: &tools,
+                    observer: &observer,
+                    silent: true,
+                    approval: None,
+                    multimodal_config: &multimodal,
+                    config: None,
+                    hooks: None,
+                    activated_tools: None,
+                    model_switch_callback: None,
+                    receipt_generator: None,
+                    security: None,
+                },
+                ResolvedRuntimeKnobs {
+                    max_tool_iterations: 1,
+                    excluded_tools: &[],
+                    dedup_exempt_tools: &[],
+                    pacing: &pacing,
+                    strict_tool_parsing: false,
+                    parallel_tools: false,
+                    max_tool_result_chars: 0,
+                    context_limits: zeroclaw_config::schema::ResolvedContextLimits::legacy_fallback(
+                        0,
+                    ),
+                    context_limits_resolver: None,
+                    knobs: &knobs,
+                },
+            ),
+            history: &mut history,
+            history_has_trim_breadcrumb: &mut crumb,
+            injected_memory_preamble: &mut memory_preamble,
+            channel_name: "delegate-test",
+            channel_reply_target: None,
+            cancellation_token: None,
+            on_delta: None,
+            shared_budget: None,
+            channel: None,
+            collected_receipts: None,
+            event_tx: None,
+            steering: None,
+            new_messages_out: None,
+            image_cache: None,
+            memory: None,
+            ingress: zeroclaw_api::ingress::IngressContext::sub_turn(),
+            agent_alias: Some("caller"),
+            parent_agent_alias: None,
+            turn_id: "parent-protocol-test",
+            served_route_sink: None,
+            sop_reassembly: None,
+        })
+        .await
+        .unwrap();
+        provider.request().system_prompt.unwrap()
+    }
+
+    async fn assert_nested_delegate_owns_protocol_prompts(native_tools: bool, strict: bool) {
+        use crate::agent::turn::{ToolProtocolPrompts, scope_tool_protocol_prompts};
+        // Reach the actual provider-bound request, not just prompt assembly:
+        // a capped caller native cache formerly replaced this target's identity.
+        for mode in [
+            DelegateExecutionMode::Bounded,
+            DelegateExecutionMode::Independent,
+        ] {
+            for target_cap in [0, 12_000] {
+                let mut fixture = delegate_memory_fixture(None).await;
+                let mut config = (**fixture.tool.root_config.as_ref().unwrap()).clone();
+                config.agents.get_mut("caller").unwrap().delegates = vec![DelegateTargetConfig {
+                    agent: "target".into(),
+                    mode,
+                }];
+                let target_workspace = fixture._tmp.path().join("target-workspace");
+                config.agents.get_mut("target").unwrap().workspace.path =
+                    Some(target_workspace.clone());
+                let runtime = config.runtime_profiles.get_mut("agentic_test").unwrap();
+                runtime.max_system_prompt_chars = Some(target_cap);
+                runtime.strict_tool_parsing = strict;
+                std::fs::create_dir_all(&target_workspace).unwrap();
+                std::fs::write(
+                    target_workspace.join("AGENTS.md"),
+                    format!("CHILD_ROLE_ONLY\n{}", "child padding ".repeat(2_000)),
+                )
+                .unwrap();
+                fixture.tool.runtime_profiles = Arc::new(config.runtime_profiles.clone());
+                fixture.tool = fixture
+                    .tool
+                    .with_root_config(Arc::new(config))
+                    .with_runtime(Arc::new(DelegateTestRuntime));
+                let provider = ThinkingRecordingModelProvider {
+                    native_tools,
+                    ..Default::default()
+                };
+                let parent_native = format!(
+                    "PARENT_PRIVATE_ROLE\n\n## Safety\nparent safety\n{}",
+                    "parent padding ".repeat(2_000)
+                );
+                let parent_text = parent_native
+                    .replace("## Safety", "## Tools\nPARENT_PRIVATE_TOOL\n\n## Safety");
+                let prompts = Arc::new(ToolProtocolPrompts::with_max_chars(
+                    parent_native,
+                    parent_text.clone(),
+                    3_000,
+                ));
+                scope_tool_protocol_prompts(prompts, async {
+                    let result = fixture
+                        .tool
+                        .execute_agentic(
+                            "target",
+                            &fixture.target_config,
+                            "custom",
+                            "test-model",
+                            &provider,
+                            "child task",
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(
+                        result.success,
+                        "{mode:?}/{native_tools}/{target_cap}: {result:?}"
+                    );
+                    let child = provider.request().system_prompt.unwrap();
+                    assert!(
+                        child.contains("CHILD_ROLE_ONLY"),
+                        "{mode:?}/{native_tools}/{target_cap}: {child}"
+                    );
+                    assert!(child.contains("## Safety"), "target safety must survive");
+                    assert!(!child.contains("PARENT_PRIVATE_ROLE"));
+                    assert!(!child.contains("PARENT_PRIVATE_TOOL"));
+                    if !native_tools && !strict {
+                        assert!(
+                            child.contains("memory_recall"),
+                            "target text tool must survive"
+                        );
+                    } else if !native_tools {
+                        assert!(
+                            !child.contains("## Tools"),
+                            "strict text targets suppress tool descriptions"
+                        );
+                    }
+                    if target_cap > 0 {
+                        assert!(child.chars().count() <= target_cap);
+                    } else {
+                        assert!(
+                            child.chars().count() > 12_000,
+                            "zero target cap must not inherit parent cap"
+                        );
+                    }
+                    // Cancellation must unwind only the child's transient scope.
+                    fixture.tool.cancellation_token().cancel();
+                    let cancelled = fixture
+                        .tool
+                        .execute_agentic(
+                            "target",
+                            &fixture.target_config,
+                            "custom",
+                            "test-model",
+                            &provider,
+                            "cancelled child task",
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                    assert!(!cancelled.success, "{cancelled:?}");
+                    assert!(
+                        provider.requests.lock().unwrap().is_empty(),
+                        "cancelled child must not call the provider"
+                    );
+                    let parent = capture_parent_protocol_request(parent_text.clone()).await;
+                    assert!(parent.contains("PARENT_PRIVATE_ROLE"));
+                    assert!(!parent.contains("CHILD_ROLE_ONLY"));
+                    assert!(
+                        !parent.contains("PARENT_PRIVATE_TOOL"),
+                        "native parent must keep its own transport policy"
+                    );
+                    assert!(parent.chars().count() <= 3_000);
+                })
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_native_delegate_owns_protocol_prompts_and_restores_parent_cache() {
+        assert_nested_delegate_owns_protocol_prompts(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn nested_text_delegate_owns_protocol_prompts_and_restores_parent_cache() {
+        assert_nested_delegate_owns_protocol_prompts(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn nested_strict_text_delegate_owns_protocol_prompts_and_restores_parent_cache() {
+        assert_nested_delegate_owns_protocol_prompts(false, true).await;
     }
 
     #[tokio::test]

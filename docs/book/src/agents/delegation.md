@@ -204,6 +204,8 @@ This policy lives on the target, not the caller. Same-profile peers use the shar
 
 When the target's configured Reliable provider chain mixes native-tool-capable and text-only candidates, `strict_tool_parsing = false` uses one text/XML tool protocol for the whole agentic turn so every reachable fallback can execute tools. If effective tools remain and `strict_tool_parsing = true`, ZeroClaw rejects the mixed chain before making a provider request because strict parsing forbids that text/XML fallback protocol. Uniform chains are unchanged: all-native chains use native tool transport, while deliberately all-text chains follow the configured text-tool policy.
 
+Each agentic delegate scopes its own complete native and text prompt variants around the child loop. Both variants use the child's assembled target identity, admitted tool surface, skills, deferred-tool descriptions, approval guidance, and thinking prefix. A caller's cached system prompt or text-tool section is never reused for the target. Provider-bound child prompts follow the target's `max_system_prompt_chars` setting; `0` remains unlimited. Returning, failing, timing out, or cancelling the child restores the caller's prompt scope. This does not change the bounded or independent tool, workspace, approval, or memory boundaries described above.
+
 ### Independent delegate approvals
 
 An independent agentic target can send tool approval requests to the operator selected by its own risk profile's `approval_route`. Set both `approver_channel` and a non-blank `approver_recipient`, and keep that channel enabled and registered in the running daemon. The caller must already authorize that named target in independent mode; an approval route does not grant delegation reach or additional tools.
