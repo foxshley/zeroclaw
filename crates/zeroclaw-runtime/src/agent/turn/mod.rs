@@ -2199,8 +2199,8 @@ async fn run_tool_call_loop_impl<'a>(
         let provider_dispatch_model = hook_selected_model
             .as_deref()
             .unwrap_or(active_dispatch_model);
-        // Only direct Agent turns scope the complete prompt variants. Preserve
-        // the channel loop's existing hook/protocol behavior rather than
+        // Agent and delegate turns scope their own complete prompt variants.
+        // Preserve the channel loop's existing hook/protocol behavior rather than
         // silently widening this delegation-focused repair into channel prompt
         // reconciliation.
         let uses_scoped_tool_protocol = TOOL_PROTOCOL_PROMPTS.try_with(|_| ()).is_ok();
