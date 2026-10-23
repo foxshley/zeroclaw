@@ -933,21 +933,18 @@ pub(crate) fn process_sse_chunk(
             continue;
         }
         let event = serde_json::from_str::<Value>(line).map_err(|err| {
-            let sanitized = super::sanitize_api_error(line);
             ::zeroclaw_log::record!(
                 ERROR,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "phase": "sse_parse",
-                        "payload": &sanitized,
-                        "error": format!("{}", err),
+                        "line": err.line(),
+                        "column": err.column(),
                     })),
                 "openai_codex: SSE data parse failed"
             );
-            anyhow::Error::msg(format!(
-                "OpenAI Codex SSE data parse failed: {err}. Payload: {sanitized}"
-            ))
+            anyhow::Error::msg("OpenAI Codex SSE data parse failed")
         })?;
         emitted.extend(process_responses_stream_event(event, state)?);
     }
@@ -968,6 +965,13 @@ fn parse_sse_turn(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     if !buffer.trim().is_empty() {
         process_sse_chunk(&buffer, &mut state)?;
     }
+
+    // Buffered output has not crossed the consumer boundary yet, but EOF alone
+    // must not turn partial text or tool calls into a completed response.
+    anyhow::ensure!(
+        state.saw_completion,
+        "OpenAI Codex SSE stream closed before completion: response truncated"
+    );
 
     Ok(ResponsesTurnResult {
         text: if state.saw_text_delta {
@@ -1091,47 +1095,29 @@ fn parse_responses_body(body: &str) -> anyhow::Result<ResponsesTurnResult> {
     if looks_like_sse {
         let result = parse_sse_turn(body)?;
         return ensure_nonempty_responses_turn(result, || {
-            let sanitized = super::sanitize_api_error(body);
-            ::zeroclaw_log::record!(
-                ERROR,
-                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                    .with_attrs(::serde_json::json!({"payload": &sanitized})),
-                "openai_codex: empty SSE stream payload"
-            );
-            anyhow::Error::msg(format!(
-                "No response from OpenAI Codex stream payload: {sanitized}"
-            ))
+            anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+                .context("No response from OpenAI Codex stream")
         });
     }
 
     let parsed: ResponsesResponse = serde_json::from_str(body).map_err(|err| {
-        let sanitized = super::sanitize_api_error(body);
         ::zeroclaw_log::record!(
             ERROR,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                 .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                 .with_attrs(::serde_json::json!({
-                    "payload": &sanitized,
-                    "error": format!("{}", err),
+                    "payload_bytes": body.len(),
+                    "line": err.line(),
+                    "column": err.column(),
                 })),
             "openai_codex: JSON parse failed"
         );
-        anyhow::Error::msg(format!(
-            "OpenAI Codex JSON parse failed: {err}. Payload: {sanitized}"
-        ))
+        anyhow::Error::msg("OpenAI Codex JSON parse failed")
     })?;
     let result = responses_turn_from_response(&parsed);
     ensure_nonempty_responses_turn(result, || {
-        let sanitized = super::sanitize_api_error(body);
-        ::zeroclaw_log::record!(
-            ERROR,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                .with_attrs(::serde_json::json!({"payload": &sanitized})),
-            "openai_codex: empty response"
-        );
-        anyhow::Error::msg(format!("No response from OpenAI Codex: {sanitized}"))
+        anyhow::Error::new(zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion)
+            .context("No response from OpenAI Codex")
     })
 }
 
@@ -1366,7 +1352,7 @@ impl OpenAiCodexModelProvider {
 
         let tools_count = tools.as_ref().map_or(0, Vec::len);
         let has_tools = has_turn_tools(tools.as_ref());
-        let mut request = ResponsesRequest {
+        let request = ResponsesRequest {
             model: normalized_model.to_string(),
             input,
             instructions,
@@ -1419,60 +1405,10 @@ impl OpenAiCodexModelProvider {
             return Err(super::api_error("OpenAI Codex", response).await);
         }
 
-        match decode_responses_body(response).await {
-            Ok(result) => Ok(result),
-            Err(stream_err) => {
-                if stream_err
-                    .downcast_ref::<ResponsesStreamApiError>()
-                    .is_some()
-                {
-                    return Err(stream_err);
-                }
-
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                        .with_attrs(::serde_json::json!({"error": format!("{}", stream_err)})),
-                    "OpenAI Codex streaming response decode failed, retrying without streaming"
-                );
-
-                request.stream = false;
-                let non_streaming_response = self
-                    .responses_request_builder(
-                        &creds.bearer_token,
-                        creds.account_id.as_deref(),
-                        creds.access_token.as_deref(),
-                        creds.use_gateway_api_key_auth,
-                        &request,
-                    )
-                    .json(&request)
-                    .send()
-                    .await?;
-
-                if !non_streaming_response.status().is_success() {
-                    return Err(super::api_error("OpenAI Codex", non_streaming_response).await);
-                }
-
-                decode_responses_body(non_streaming_response)
-                    .await
-                    .map_err(|fallback_err| {
-                        ::zeroclaw_log::record!(
-                            ERROR,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                .with_attrs(::serde_json::json!({
-                                    "stream_err": format!("{}", stream_err),
-                                    "fallback_err": format!("{}", fallback_err),
-                                })),
-                            "openai_codex: stream + non-stream fallback both failed"
-                        );
-                        anyhow::Error::msg(format!(
-                            "OpenAI Codex streaming response decode failed ({stream_err}); non-streaming retry failed ({fallback_err})"
-                        ))
-                    })
-            }
-        }
+        // ReliableModelProvider owns the retry budget. Retrying here would
+        // multiply its attempts, and Codex requires stream=true even when the
+        // caller buffers the response instead of consuming token events.
+        decode_responses_body(response).await
     }
 }
 
@@ -2201,7 +2137,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_retries_non_streaming_when_stream_decode_fails() {
+    async fn reliable_codex_retries_streaming_when_stream_decode_fails() {
         let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
             mock_codex_provider(vec![
                 MockCodexReply::Sse("data: not-json\n\ndata: [DONE]\n"),
@@ -2212,6 +2148,12 @@ mod tests {
             ])
             .await;
 
+        let provider = crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![("openai_codex".into(), Box::new(provider))],
+            1,
+            1,
+        );
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
             .chat(
@@ -2224,20 +2166,21 @@ mod tests {
                 None,
             )
             .await
-            .expect("provider should retry with stream=false after streaming decode failure");
+            .expect("Reliable should retry the failed model request with streaming enabled");
 
         assert_eq!(response.text.as_deref(), Some("fallback ok"));
 
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 2, "expected one retry request");
         assert_eq!(requests[0]["stream"], true);
-        assert_eq!(requests[1]["stream"], false);
+        assert_eq!(requests[1]["stream"], true);
+        assert_eq!(requests[0], requests[1]);
 
         server_handle.abort();
     }
 
     #[tokio::test]
-    async fn codex_retries_non_streaming_when_stream_contains_malformed_frame_after_text() {
+    async fn reliable_codex_retries_streaming_after_buffered_malformed_frame() {
         let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
             MockCodexReply::Sse(
                 "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\ndata: not-json\n\ndata: [DONE]\n",
@@ -2249,6 +2192,12 @@ mod tests {
         ])
         .await;
 
+        let provider = crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![("openai_codex".into(), Box::new(provider))],
+            1,
+            1,
+        );
         let messages = vec![ChatMessage::user("hello")];
         let response = provider
             .chat(
@@ -2268,9 +2217,104 @@ mod tests {
         let requests = captured.lock().unwrap();
         assert_eq!(requests.len(), 2, "expected one retry request");
         assert_eq!(requests[0]["stream"], true);
-        assert_eq!(requests[1]["stream"], false);
+        assert_eq!(requests[1]["stream"], true);
+        assert_eq!(requests[0], requests[1]);
 
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reliable_codex_recovers_empty_streams_without_replaying_tool_history() {
+        for first_reply in [
+            "",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_test\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+        ] {
+            let (provider, captured, server_handle, _temp_dir, _proxy_guard) =
+                mock_codex_provider(vec![
+                    MockCodexReply::Sse(first_reply),
+                    MockCodexReply::Sse("data: {\"type\":\"response.completed\",\"response\":{\"output_text\":\"recovered\"}}\n\n"),
+                ]).await;
+            let provider = crate::reliable::ReliableModelProvider::new(
+                "test",
+                vec![("openai_codex".into(), Box::new(provider))],
+                1,
+                1,
+            );
+            let messages = vec![
+                ChatMessage::user("heart"),
+                ChatMessage::assistant(
+                    r#"{"tool_calls":[{"id":"call_reaction","name":"reaction","arguments":"{}"}]}"#,
+                ),
+                ChatMessage::tool(
+                    r#"{"tool_call_id":"call_reaction","content":"reaction completed"}"#,
+                ),
+            ];
+            let response = provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "gpt-5-codex",
+                    None,
+                )
+                .await
+                .expect("one failed model request should recover");
+            assert_eq!(response.text.as_deref(), Some("recovered"));
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0]["stream"], true);
+            assert_eq!(requests[1]["stream"], true);
+            assert_eq!(
+                requests[0], requests[1],
+                "recovery must retain the current model request"
+            );
+            assert!(
+                requests[1]["input"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| item["type"] == "function_call_output")
+            );
+            server_handle.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn reliable_codex_stream_failures_obey_configured_retry_budget() {
+        for retries in [0, 1, 2] {
+            let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(
+                (0..=retries)
+                    .map(|_| MockCodexReply::Sse("data: {\"type\":\"response.created\"}\n\n"))
+                    .collect(),
+            )
+            .await;
+            let provider = crate::reliable::ReliableModelProvider::new(
+                "test",
+                vec![("openai_codex".into(), Box::new(provider))],
+                retries,
+                1,
+            );
+            let messages = vec![ChatMessage::user("hello")];
+            provider
+                .chat(
+                    ProviderChatRequest {
+                        messages: &messages,
+                        tools: None,
+                        thinking: None,
+                    },
+                    "gpt-5-codex",
+                    None,
+                )
+                .await
+                .expect_err("persistent stream failures must exhaust the configured budget");
+            let requests = captured.lock().unwrap();
+            assert_eq!(requests.len(), retries as usize + 1);
+            assert!(requests.iter().all(|request| request["stream"] == true));
+            server_handle.abort();
+        }
     }
 
     #[tokio::test]
@@ -2301,8 +2345,44 @@ mod tests {
                 .contains("OpenAI responses stream error: quota exceeded"),
             "{err}"
         );
+        assert!(err.is::<ResponsesStreamApiError>());
         assert_eq!(captured.lock().unwrap().len(), 1);
 
+        server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn reliable_codex_preserves_terminal_stream_api_errors() {
+        let (provider, captured, server_handle, _temp_dir, _proxy_guard) = mock_codex_provider(vec![
+            MockCodexReply::Sse(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: {\"type\":\"error\",\"message\":\"401 Unauthorized\"}\n\n",
+            ),
+        ]).await;
+        let provider = crate::reliable::ReliableModelProvider::new(
+            "test",
+            vec![("openai_codex".into(), Box::new(provider))],
+            3,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hello")];
+        let error = provider
+            .chat(
+                ProviderChatRequest {
+                    messages: &messages,
+                    tools: None,
+                    thinking: None,
+                },
+                "gpt-5-codex",
+                None,
+            )
+            .await
+            .expect_err("terminal provider errors cannot be repaired by retrying");
+        let source = error
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ResponsesStreamApiError>())
+            .expect("the original provider error should remain in the error chain");
+        assert_eq!(source.0, "401 Unauthorized");
+        assert_eq!(captured.lock().unwrap().len(), 1);
         server_handle.abort();
     }
 
@@ -2460,6 +2540,56 @@ data: [DONE]
                 .contains("OpenAI Codex SSE data parse failed"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn buffered_sse_requires_completion_before_returning_text_or_tools() {
+        for payload in [
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_test\",\"name\":\"reaction\",\"arguments\":\"{}\"}}\n\n",
+        ] {
+            let error =
+                parse_responses_body(payload).expect_err("EOF must not commit partial output");
+            assert!(error.to_string().contains("response truncated"), "{error}");
+        }
+    }
+
+    #[test]
+    fn buffered_completed_empty_turn_is_a_typed_semantic_error() {
+        let error = parse_responses_body(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n",
+        )
+        .expect_err("completed empty turn cannot be a final answer");
+        assert!(error.is::<zeroclaw_api::model_provider::SemanticEmptyTerminalCompletion>());
+    }
+
+    #[test]
+    fn buffered_decode_errors_do_not_include_response_payloads() {
+        for payload in [
+            "data: synthetic_private_payload 400 unauthorized\n\n",
+            "synthetic_private_payload 400 unauthorized",
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"instructions\":\"synthetic_private_payload 400 unauthorized\"}}\n\n",
+        ] {
+            let error = parse_responses_body(payload).expect_err("invalid or empty response");
+            assert!(!format!("{error:#}").contains("synthetic_private_payload"));
+            assert!(!crate::reliable::is_non_retryable(&error));
+        }
+    }
+
+    #[test]
+    fn buffered_decode_error_coordinates_do_not_change_retry_classification() {
+        let malformed = format!("{{\"noise\":\"{}", "x".repeat(390));
+        assert_eq!(
+            serde_json::from_str::<Value>(&malformed)
+                .unwrap_err()
+                .column(),
+            400
+        );
+        for payload in [malformed.clone(), format!("data: {malformed}\n\n")] {
+            let error = parse_responses_body(&payload).expect_err("unterminated JSON must fail");
+            assert!(!error.to_string().contains("400"));
+            assert!(!crate::reliable::is_non_retryable(&error));
+        }
     }
 
     #[test]
